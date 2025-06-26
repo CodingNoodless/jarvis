@@ -1,6 +1,7 @@
 from core.parser import parse
 from core.dispatcher import dispatch
 from core.logger import log_parse
+from core.context import context
 
 def main():
     print("Jarvis CLI Assistant. Type 'exit' to quit.")
@@ -10,7 +11,7 @@ def main():
             break
         intent_obj = parse(user_input)
         log_parse(intent_obj)
-        response = dispatch(intent_obj)
+        response = dispatch(intent_obj, context=context)
         print(f"Jarvis: {response}")
 
 if __name__ == "__main__":
