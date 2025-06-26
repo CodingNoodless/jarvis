@@ -8,4 +8,4 @@ def dispatch(intent_obj):
     elif intent == "get_weather":
         return weather.run(intent_obj["entities"])
     else:
-        return fallback.run(intent_obj["text"])
+        return fallback.run(intent_obj["raw"])
