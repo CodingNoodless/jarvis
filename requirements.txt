@@ -1,0 +1,12 @@
+pyttsx3
+vosk
+sounddevice
+pyaudio
+sentence-transformers
+chromadb
+fastapi
+uvicorn
+schedule
+APScheduler
+python-dotenv
+requests
