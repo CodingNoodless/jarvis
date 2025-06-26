@@ -1,18 +1,26 @@
+from core.listen import listen
+from core.speak import speak
 from core.parser import parse
 from core.dispatcher import dispatch
-from core.logger import log_parse
 from core.context import context
 
+USE_VOICE = True
+
 def main():
-    print("Jarvis CLI Assistant. Type 'exit' to quit.")
+    print("Jarvis is running. Say 'exit' to quit.")
+
     while True:
-        user_input = input("You: ")
-        if user_input.lower() in ["exit", "quit"]:
+        if USE_VOICE:
+            text = listen()
+        else:
+            text = input("You: ")
+
+        if "exit" in text.lower():
             break
-        intent_obj = parse(user_input)
-        log_parse(intent_obj)
-        response = dispatch(intent_obj, context=context)
-        print(f"Jarvis: {response}")
+
+        intent = parse(text)
+        response = dispatch(intent, context=context)
+        speak(response)
 
 if __name__ == "__main__":
     main()
