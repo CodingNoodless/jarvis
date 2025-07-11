@@ -8,7 +8,7 @@ import pyaudio
 import struct
 import soundfile as sf
 from io import BytesIO
-from threading import Thread, Event
+from threading import Thread, Event, Lock
 from TTS.api import TTS as CoquiTTS
 import webrtcvad
 import collections
@@ -23,10 +23,8 @@ print("🔊 Loading Whisper model...")
 whisper_model = WhisperModel("tiny", compute_type="int8")
 
 print("🔊 Loading British TTS model...")
-# Use VCTK model for authentic British accents
 vits_tts = CoquiTTS(model_name="tts_models/en/vctk/vits", gpu=True)
 print("⏳ Warming up TTS...")
-# Use p230 - British male, fastest synthesis speed with British accent
 _ = vits_tts.tts("Hello, Jarvis is ready.", speaker="p230")
 VITS_SR = 22050
 
@@ -38,29 +36,42 @@ audio_stream = pa.open(rate=porcupine.sample_rate, channels=1, format=pyaudio.pa
 
 audio_queue = queue.Queue()
 transcription_queue = queue.Queue()
-
-# This queue holds text chunks ready for TTS synthesis
-tts_text_queue = queue.Queue()
-
-# This queue holds synthesized audio chunks ready for playback
-tts_audio_queue = queue.Queue()
-
+audio_chunk_queue = queue.Queue()
+tts_synthesis_queue = queue.PriorityQueue()
 stop_event = Event()
 
+# Audio playback state - REVAMPED SYSTEM
+audio_stream_lock = Lock()
+current_audio_stream = None
+audio_buffer = np.array([], dtype=np.float32)
+buffer_ready = Event()
+is_playing = False
+prebuffer_threshold = 0.5  # 500ms of audio before starting playback
+
+# Multiple TTS instances for parallel synthesis
+NUM_TTS_WORKERS = 3
+tts_instances = []
+
+print("🔊 Loading multiple TTS instances for parallel synthesis...")
+for i in range(NUM_TTS_WORKERS):
+    print(f"🔊 Loading TTS instance {i+1}/{NUM_TTS_WORKERS}...")
+    tts_instance = CoquiTTS(model_name="tts_models/en/vctk/vits", gpu=True)
+    _ = tts_instance.tts("Warmup", speaker="p230")
+    tts_instances.append(tts_instance)
+print(f"✅ {NUM_TTS_WORKERS} TTS instances loaded")
+
 def record_audio_vad(max_duration=30, samplerate=SAMPLERATE):
-    # Smart VAD for detecting complete speech, including long prompts
-    vad = webrtcvad.Vad(2)  # More aggressive VAD for better speech detection
+    vad = webrtcvad.Vad(2)
     frame_duration = 30
     frame_size = int(samplerate * frame_duration / 1000)
-    ring = collections.deque(maxlen=10)  # Larger ring buffer for better speech detection
+    ring = collections.deque(maxlen=10)
     q = queue.Queue()
     recording = []
     triggered = False
     silence_count = 0
-    min_speech_frames = 4  # Minimum frames to consider speech started
-    # Dynamic silence threshold - longer silence required after longer speech
-    base_silence_threshold = 8  # Base frames of silence to stop recording
-    speech_duration_frames = 0  # Track how long we've been recording speech
+    min_speech_frames = 4
+    base_silence_threshold = 8
+    speech_duration_frames = 0
 
     def callback(indata, frames, time_info, status):
         q.put(indata[:, 0].copy())
@@ -81,7 +92,6 @@ def record_audio_vad(max_duration=30, samplerate=SAMPLERATE):
             if not triggered:
                 ring.append((chunk, speech))
                 speech_frames = sum(1 for c, s in ring if s)
-                # Start recording with fewer speech frames detected
                 if speech_frames >= min_speech_frames:
                     triggered = True
                     for c, _ in ring:
@@ -95,14 +105,12 @@ def record_audio_vad(max_duration=30, samplerate=SAMPLERATE):
                     silence_count = 0
                 else:
                     silence_count += 1
-                    # Dynamic silence threshold based on speech duration
-                    # Longer speeches require more silence to confirm end
-                    if speech_duration_frames > 100:  # Long speech (>3 seconds)
-                        silence_threshold = base_silence_threshold + 6  # 14 frames (~0.4s)
-                    elif speech_duration_frames > 50:  # Medium speech (>1.5 seconds)
-                        silence_threshold = base_silence_threshold + 3  # 11 frames (~0.33s)
-                    else:  # Short speech
-                        silence_threshold = base_silence_threshold  # 8 frames (~0.24s)
+                    if speech_duration_frames > 100:
+                        silence_threshold = base_silence_threshold + 6
+                    elif speech_duration_frames > 50:
+                        silence_threshold = base_silence_threshold + 3
+                    else:
+                        silence_threshold = base_silence_threshold
                     
                     if silence_count >= silence_threshold:
                         break
@@ -129,54 +137,42 @@ def transcription_worker():
         audio_queue.task_done()
 
 def llm_worker():
-    """
-    This worker streams LLM output, buffers partial chunks,
-    and pushes well-formed text chunks to tts_text_queue.
-    """
-    sentence_end_chars = {'.', '!', '?'}
+    # Expanded punctuation marks for better chunking
+    chunk_end_chars = {'.', '!', '?', ',', ';', ':', '—', '–', '-'}
     buffer = ""
     chunk_sequence = 0
 
-    def find_smart_chunk_boundary(text, min_length=10, chunk_sequence=0):
-        """Ensure complete words and low latency for first chunk"""
+    def find_punctuation_chunk(text, chunk_sequence=0):
+        """Find the next complete chunk ending at punctuation"""
         text = text.strip()
         
-        # For first chunk, be more aggressive to reduce latency
-        if chunk_sequence == 0:
-            min_length = 4  # Ultra-short first chunk for immediate response
-        elif chunk_sequence == 1:
-            min_length = 8  # Second chunk slightly longer
-        else:
-            min_length = max(min_length, 12)  # Subsequent chunks longer for better quality
-        
-        # Don't chunk if text is too short
-        if len(text) < min_length:
+        # Don't send empty chunks
+        if not text:
             return None
         
-        # Priority 1: Look for sentence endings (natural pause points)
+        # For the first chunk, allow smaller chunks to start playback quickly
+        min_length = 10 if chunk_sequence == 0 else 15
+        
+        # If text is shorter than minimum and we have some content, return it
+        if len(text) < min_length and chunk_sequence > 0:
+            return None
+        
+        # Look for punctuation marks
         for i, char in enumerate(text):
-            if char in sentence_end_chars and i >= min_length:
-                # Make sure we're at a word boundary
-                if i + 1 >= len(text) or text[i + 1] == ' ':
-                    return text[:i+1].strip()
+            if char in chunk_end_chars and i >= min_length:
+                # Make sure we include the punctuation and any following space
+                end_pos = i + 1
+                while end_pos < len(text) and text[end_pos] in ' \t':
+                    end_pos += 1
+                return text[:end_pos].strip()
         
-        # Priority 2: Look for comma boundaries (natural pause points)
-        for i, char in enumerate(text):
-            if char == ',' and i >= min_length:
-                # Make sure we're at a word boundary
-                if i + 1 >= len(text) or text[i + 1] == ' ':
-                    return text[:i+1].strip()
+        # If we have a very long text without punctuation, break at a space
+        if len(text) > 100:
+            for i in range(80, len(text)):
+                if text[i] == ' ':
+                    return text[:i].strip()
         
-        # Priority 3: Find word boundary - NEVER break words
-        # Look for spaces after min_length
-        for i in range(min_length, len(text)):
-            if text[i] == ' ':
-                # Ensure we have complete words by checking boundaries
-                chunk = text[:i].strip()
-                if chunk and ' ' in chunk:  # Ensure we have at least one complete word
-                    return chunk
-        
-        # If no good boundary found, don't chunk yet
+        # If no punctuation found and not too long, return None to wait for more
         return None
 
     while not stop_event.is_set():
@@ -196,6 +192,11 @@ def llm_worker():
         buffer = ""
         chunk_sequence = 0
         
+        # Clear audio buffer for new response
+        with audio_stream_lock:
+            global audio_buffer
+            audio_buffer = np.array([], dtype=np.float32)
+        
         try:
             res = requests.post(
                 "http://localhost:11434/api/generate",
@@ -204,11 +205,11 @@ def llm_worker():
                 "prompt": f"You are Jarvis, a helpful AI assistant. Provide a clear, complete answer to: {prompt}",
                 "stream": True,
                 "options": {
-                    "num_predict": 150,  # Allow longer responses to prevent cut-off
+                    "num_predict": 150,
                     "temperature": 0.7,
                     "top_p": 0.9,
                     "repeat_penalty": 1.1,
-                    "stop": ["\n\n", "User:", "Human:"]  # Natural stopping points
+                    "stop": ["\n\n", "User:", "Human:"]
                 }
                 },
                 stream=True,
@@ -226,146 +227,205 @@ def llm_worker():
                         if chunk:
                             buffer += chunk
 
-                            # Check for smart chunk boundary
-                            chunked_text = find_smart_chunk_boundary(buffer, chunk_sequence=chunk_sequence)
+                            # Try to find a complete chunk ending with punctuation
+                            chunked_text = find_punctuation_chunk(buffer, chunk_sequence=chunk_sequence)
                             if chunked_text:
-                                # Add sequence number for ordered playback
-                                tts_text_queue.put((chunk_sequence, chunked_text))
-                                # Remove exactly what we sent, but preserve word boundaries
-                                # Find the exact end position of the chunked text in buffer
-                                chunk_end_pos = buffer.find(chunked_text) + len(chunked_text)
-                                # Skip any trailing spaces/punctuation but preserve next word
-                                while chunk_end_pos < len(buffer) and buffer[chunk_end_pos] in ' .,!?':
-                                    chunk_end_pos += 1
-                                buffer = buffer[chunk_end_pos:]
+                                print(f"📝 Sending chunk {chunk_sequence}: {chunked_text!r}")
+                                tts_synthesis_queue.put((0, chunk_sequence, chunked_text))
+                                
+                                # Remove the chunked text from buffer
+                                buffer = buffer[len(chunked_text):].lstrip()
                                 chunk_sequence += 1
                                 
                     except json.JSONDecodeError:
                         continue
             
-            # Flush remaining buffer at end
+            # Send any remaining text as the final chunk
             if buffer.strip():
-                tts_text_queue.put((chunk_sequence, buffer.strip()))
+                print(f"📝 Sending final chunk {chunk_sequence}: {buffer.strip()!r}")
+                tts_synthesis_queue.put((0, chunk_sequence, buffer.strip()))
 
             print(f"⏱️ LLM call finished in {time.time() - start:.2f}s")
 
         except Exception as e:
             print("LLM request error:", e)
-            tts_text_queue.put((0, "Sorry, I encountered an error."))
+            tts_synthesis_queue.put((0, 0, "Sorry, I encountered an error."))
 
         transcription_queue.task_done()
 
-def tts_synthesis_worker():
-    """
-    Synthesizes audio from text chunks and pushes to playback queue.
-    Simplified approach for immediate playback.
-    """
+def tts_synthesis_worker(worker_id):
+    tts_instance = tts_instances[worker_id]
+    
     while not stop_event.is_set():
         try:
-            text_data = tts_text_queue.get(timeout=0.1)
+            priority, sequence, text_chunk = tts_synthesis_queue.get(timeout=0.1)
         except queue.Empty:
             continue
         
         try:
-            # Unpack sequence and text
-            sequence, text_chunk = text_data
-            
             start = time.time()
-            # Use p230 - British male, fastest synthesis with clear accent
-            wav = vits_tts.tts(text_chunk, speaker="p230")
+            wav = tts_instance.tts(text_chunk, speaker="p230", speed=1.2)
             synthesis_time = time.time() - start
             
-            print(f"⏱️ TTS synthesis took {synthesis_time:.2f}s for chunk #{sequence}: {text_chunk!r}")
+            print(f"⏱️ Worker {worker_id} TTS synthesis took {synthesis_time:.2f}s for chunk {sequence}: {text_chunk!r}")
             
-            # Immediately queue for playback with sequence info
-            tts_audio_queue.put((sequence, wav))
+            if isinstance(wav, list):
+                wav = np.array(wav, dtype=np.float32)
             
-            # Force immediate processing by yielding to other threads
-            time.sleep(0.001)
-                
+            max_val = np.max(np.abs(wav))
+            if max_val > 0:
+                wav = wav / max_val * 0.95
+            
+            # Apply fade-out only at the very end of the response
+            if sequence > 1000:  # Special marker for final chunk
+                if len(wav) > 100:
+                    wav[-50:] *= np.linspace(1, 0, 50)
+            
+            audio_chunk_queue.put((sequence, wav))
+            
         except Exception as e:
-            print("💥 TTS Error:", e)
+            print(f"💥 Worker {worker_id} TTS Error:", e)
             
-        tts_text_queue.task_done()
+        tts_synthesis_queue.task_done()
 
-def tts_playback_worker():
-    """
-    Plays synthesized audio chunks with true seamless streaming playback.
-    Prevents duplicate playback and ensures proper sequencing.
-    """
-    playback_buffer = {}
-    next_expected_sequence = 0
-    played_sequences = set()  # Track played sequences to prevent duplicates
-    current_query_id = None
+def audio_callback(outdata, frames, time_info, status):
+    """Optimized audio callback with continuous playback"""
+    global audio_buffer
+    outdata[:, 0] = 0  # Initialize with silence
+    
+    with audio_stream_lock:
+        available = len(audio_buffer)
+        if available == 0:
+            return
+        
+        # Calculate how much we can copy
+        to_copy = min(frames, available)
+        outdata[:to_copy, 0] = audio_buffer[:to_copy]
+        
+        # Remove the copied portion
+        audio_buffer = audio_buffer[to_copy:]
+        
+        # If we didn't fill the buffer, silence will remain
+        # which is acceptable for end of response
+
+def continuous_audio_feeder():
+    """Advanced audio feeder with pre-buffering and seamless concatenation"""
+    global audio_buffer
+    
+    # We'll collect chunks until we have enough to start playback
+    pending_chunks = []
+    current_sequence = 0
+    response_start_time = 0
+    first_chunk_received = False
     
     while not stop_event.is_set():
-        # Check if we have audio data ready
         try:
-            audio_data = tts_audio_queue.get(timeout=0.001)  # Ultra-frequent checks
-            sequence, audio_chunk = audio_data
+            sequence, audio_chunk = audio_chunk_queue.get(timeout=0.001)
             
-            # Reset sequence for new query (if sequence 0 appears and we're not at the beginning)
-            if sequence == 0 and next_expected_sequence != 0:
-                # Stop current playback immediately
-                sd.stop()
-                # New query started, reset everything
-                next_expected_sequence = 0
-                playback_buffer.clear()
-                played_sequences.clear()
-                current_query_id = time.time()  # Use timestamp as query ID
+            # If this is the first chunk of a new response
+            if not first_chunk_received:
+                first_chunk_received = True
+                response_start_time = time.time()
+                pending_chunks = []
+                current_sequence = sequence
             
-            # Avoid duplicate chunks - skip if already played
-            if sequence in played_sequences:
-                print(f"⚠️ Skipping duplicate chunk #{sequence}")
-                tts_audio_queue.task_done()
-                continue
+            # Track sequence to handle out-of-order chunks
+            if sequence == current_sequence:
+                pending_chunks.append(audio_chunk)
+                current_sequence += 1
+                
+                # Check if we have the next chunks already
+                while True:
+                    next_seq = current_sequence
+                    found = False
+                    # Check if we have the next chunk in queue without blocking
+                    for i in range(audio_chunk_queue.qsize()):
+                        try:
+                            seq, chunk = audio_chunk_queue.get_nowait()
+                            if seq == next_seq:
+                                pending_chunks.append(chunk)
+                                current_sequence += 1
+                                found = True
+                            else:
+                                # Not in sequence, put back
+                                audio_chunk_queue.put((seq, chunk))
+                        except queue.Empty:
+                            break
+                    if not found:
+                        break
+                
+                # Concatenate all pending chunks
+                if pending_chunks:
+                    # Apply crossfade between chunks
+                    concatenated = pending_chunks[0]
+                    for i in range(1, len(pending_chunks)):
+                        prev = concatenated
+                        next_chunk = pending_chunks[i]
+                        
+                        # Crossfade the last 10ms of previous with first 10ms of next
+                        fade_len = min(220, len(prev), min(220, len(next_chunk)))  # 10ms at 22.05kHz
+                        
+                        if fade_len > 0:
+                            # Fade out previous
+                            fade_out = np.linspace(1.0, 0.0, fade_len)
+                            prev[-fade_len:] *= fade_out
+                            
+                            # Fade in next
+                            fade_in = np.linspace(0.0, 1.0, fade_len)
+                            next_chunk[:fade_len] *= fade_in
+                            
+                            # Overlap-add
+                            concatenated = np.concatenate([
+                                concatenated[:-fade_len],
+                                concatenated[-fade_len:] + next_chunk[:fade_len],
+                                next_chunk[fade_len:]
+                            ])
+                        else:
+                            concatenated = np.concatenate([concatenated, next_chunk])
+                    
+                    # Add to global buffer
+                    with audio_stream_lock:
+                        audio_buffer = np.concatenate([audio_buffer, concatenated])
+                    
+                    print(f"🔊 Added {len(pending_chunks)} chunks to buffer (total: {len(audio_buffer)/VITS_SR:.2f}s)")
+                    pending_chunks = []
             
-            # Store in buffer with sequence number
-            playback_buffer[sequence] = audio_chunk
-            tts_audio_queue.task_done()
+            audio_chunk_queue.task_done()
             
         except queue.Empty:
+            # If we have pending chunks but no new ones, flush them
+            if pending_chunks:
+                concatenated = np.concatenate(pending_chunks)
+                with audio_stream_lock:
+                    audio_buffer = np.concatenate([audio_buffer, concatenated])
+                print(f"🔊 Flushed {len(pending_chunks)} chunks to buffer (total: {len(audio_buffer)/VITS_SR:.2f}s)")
+                pending_chunks = []
+                first_chunk_received = False
             pass
-        
-        # Play all available chunks in sequence immediately
-        while next_expected_sequence in playback_buffer:
-            # Double-check we haven't played this sequence
-            if next_expected_sequence in played_sequences:
-                del playback_buffer[next_expected_sequence]
-                next_expected_sequence += 1
-                continue
-                
-            chunk_to_play = playback_buffer[next_expected_sequence]
-            
-            print(f"🔊 Playing chunk #{next_expected_sequence}")
-            
-            # Mark as played BEFORE playing to prevent race conditions
-            played_sequences.add(next_expected_sequence)
-            
-            # NON-BLOCKING playback for immediate response
-            sd.play(chunk_to_play, VITS_SR, blocking=False)
-            
-            # Calculate playback duration to ensure proper timing
-            playback_duration = len(chunk_to_play) / VITS_SR
-            
-            # Wait for this chunk to finish before starting next
-            # Use precise timing to eliminate gaps completely  
-            time.sleep(max(0.001, playback_duration - 0.01))
-            
-            del playback_buffer[next_expected_sequence]
-            next_expected_sequence += 1
-        
-        # Minimal sleep only when no chunks are available
-        time.sleep(0.001)  # 1ms check interval
 
 def main():
-    # Single TTS worker for proper sequencing
+    global current_audio_stream
+    
+    # Start continuous audio stream
+    current_audio_stream = sd.OutputStream(
+        samplerate=VITS_SR,
+        channels=1,
+        dtype='float32',
+        callback=audio_callback,
+        blocksize=2048,  # Larger blocksize for stability
+        latency='low'
+    )
+    current_audio_stream.start()
+    
     threads = [
         Thread(target=transcription_worker, daemon=True),
         Thread(target=llm_worker, daemon=True),
-        Thread(target=tts_synthesis_worker, daemon=True),
-        Thread(target=tts_playback_worker, daemon=True),
+        Thread(target=continuous_audio_feeder, daemon=True),
     ]
+    
+    # Add TTS synthesis workers
+    for i in range(NUM_TTS_WORKERS):
+        threads.append(Thread(target=tts_synthesis_worker, args=(i,), daemon=True))
 
     for t in threads:
         t.start()
@@ -388,8 +448,6 @@ def main():
                 print(f"⏱️ Recording took {record_end - record_start:.2f}s")
 
                 audio_queue.put(audio)
-
-                # Small delay to avoid busy loop
                 time.sleep(0.1)
 
     except KeyboardInterrupt:
@@ -398,10 +456,15 @@ def main():
     finally:
         print("Stopping threads...")
         stop_event.set()
+        
+        if current_audio_stream:
+            current_audio_stream.stop()
+            current_audio_stream.close()
+        
         audio_queue.join()
         transcription_queue.join()
-        tts_text_queue.join()
-        tts_audio_queue.join()
+        tts_synthesis_queue.join()
+        audio_chunk_queue.join()
 
         audio_stream.stop_stream()
         audio_stream.close()
