@@ -1,6 +1,5 @@
 import sounddevice as sd
 import numpy as np
-import requests
 import warnings
 from faster_whisper import WhisperModel
 import pvporcupine
@@ -14,22 +13,21 @@ import webrtcvad
 import collections
 import queue
 import time
-import json
 import os
 import importlib.util
 import sys
 from pathlib import Path
-from typing import Dict, List, Any, Optional
-import inspect
-from langchain.tools import BaseTool
-from langchain.agents import AgentExecutor, create_react_agent
-from langchain.prompts import PromptTemplate
-from langchain_community.llms import Ollama
-from langchain.agents import AgentType, initialize_agent
-from langchain.memory import ConversationBufferWindowMemory
-from langchain.schema import AgentAction, AgentFinish
+from typing import Optional
 import traceback
 import re
+from langchain_core.tools import tool, StructuredTool
+from langchain_core.pydantic_v1 import BaseModel, Field
+from langchain_community.chat_message_histories import ChatMessageHistory
+from langchain.agents import create_react_agent, AgentExecutor
+from langchain.prompts import PromptTemplate
+from langchain_ollama import OllamaLLM
+from langchain.memory import ConversationBufferMemory
+from langchain.callbacks import StreamingStdOutCallbackHandler
 
 warnings.filterwarnings("ignore", category=UserWarning)
 SAMPLERATE = 16000
@@ -43,77 +41,106 @@ class SkillManager:
     def __init__(self, skills_dir: str = SKILLS_DIR):
         self.skills_dir = Path(skills_dir)
         self.skills_dir.mkdir(exist_ok=True)
-        self.loaded_skills: Dict[str, BaseTool] = {}
-        self.skill_modules: Dict[str, Any] = {}
-        self.last_modified: Dict[str, float] = {}
+        self.loaded_skills = {}
+        self.last_modified = {}
         self.lock = Lock()
-        
         print(f"📁 Skills directory: {self.skills_dir.absolute()}")
         
-    def _load_skill_from_file(self, skill_file: Path) -> Optional[BaseTool]:
+    def _load_skill_from_file(self, skill_file: Path):
         """Load a skill from a Python file"""
         try:
-            spec = importlib.util.spec_from_file_location(
-                skill_file.stem, skill_file
-            )
-            if spec is None or spec.loader is None:
+            module_name = skill_file.stem
+            if module_name in sys.modules:
+                del sys.modules[module_name]
+            
+            spec = importlib.util.spec_from_file_location(module_name, skill_file)
+            if not spec or not spec.loader:
+                print(f"❌ Could not create spec for {skill_file.name}")
                 return None
                 
             module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
             spec.loader.exec_module(module)
             
-            # Look for the exported skill
-            if hasattr(module, 'skill'):
-                skill = module.skill
-                if isinstance(skill, BaseTool):
-                    return skill
-                    
-            print(f"⚠️ No valid skill found in {skill_file.name}")
-            return None
+            if not hasattr(module, 'skill'):
+                print(f"⚠️ No 'skill' attribute in {skill_file.name}")
+                return None
+                
+            skill = module.skill
+            if isinstance(skill, type) and issubclass(skill, BaseModel) and not isinstance(skill, BaseModel):
+                # Convert Pydantic model to a tool
+                tool = StructuredTool.from_pydantic(skill)
+                print(f"✅ Loaded Pydantic tool: {tool.name}")
+                return tool
+            elif callable(skill) and hasattr(skill, '__tool__'):
+                # Function decorated with @tool
+                print(f"✅ Loaded function tool: {skill.name}")
+                return skill
+            elif isinstance(skill, StructuredTool):
+                # Directly a StructuredTool
+                print(f"✅ Loaded StructuredTool: {skill.name}")
+                return skill
+            else:
+                print(f"⚠️ Unsupported skill type in {skill_file.name}: {type(skill)}")
+                return None
             
         except Exception as e:
             print(f"❌ Error loading skill {skill_file.name}: {e}")
+            traceback.print_exc()
             return None
     
-    def load_skills(self) -> List[BaseTool]:
+    def load_skills(self):
         """Load all skills from the skills directory"""
         with self.lock:
             current_skills = []
+            if not self.skills_dir.exists():
+                print(f"⚠️ Skills directory does not exist: {self.skills_dir}")
+                return current_skills
             
-            if not any(self.skills_dir.glob("*.py")):
+            skill_files = list(self.skills_dir.glob("*.py"))
+            if not skill_files:
                 print("⚠️ No skill files found in skills directory")
                 return current_skills
             
-            for skill_file in self.skills_dir.glob("*.py"):
+            print(f"🔍 Found {len(skill_files)} skill files")
+            
+            for skill_file in skill_files:
                 if skill_file.name.startswith("_"):
                     continue
                     
                 skill_name = skill_file.stem
-                file_mtime = skill_file.stat().st_mtime
                 
-                # Check if we need to reload this skill
-                if (skill_name not in self.loaded_skills or 
+                try:
+                    file_mtime = skill_file.stat().st_mtime
+                except OSError as e:
+                    print(f"❌ Cannot access file {skill_file.name}: {e}")
+                    continue
+                
+                needs_reload = (
+                    skill_name not in self.loaded_skills or 
                     skill_name not in self.last_modified or
-                    file_mtime > self.last_modified[skill_name]):
-                    
+                    file_mtime > self.last_modified.get(skill_name, 0)
+                )
+                
+                if needs_reload:
                     print(f"🔄 Loading skill: {skill_name}")
                     skill = self._load_skill_from_file(skill_file)
                     
                     if skill:
                         self.loaded_skills[skill_name] = skill
                         self.last_modified[skill_name] = file_mtime
-                        print(f"✅ Loaded skill: {skill.name}")
+                        print(f"✅ Loaded skill: {skill.name} - {skill.description}")
                     else:
-                        # Remove failed skill
                         if skill_name in self.loaded_skills:
                             del self.loaded_skills[skill_name]
+                            print(f"🗑️ Removed failed skill: {skill_name}")
                         if skill_name in self.last_modified:
                             del self.last_modified[skill_name]
                 
-                # Add to current skills if loaded successfully
                 if skill_name in self.loaded_skills:
                     current_skills.append(self.loaded_skills[skill_name])
             
+            print(f"📊 Total loaded skills: {len(current_skills)}")
             return current_skills
     
     def get_skill_info(self) -> str:
@@ -125,153 +152,194 @@ class SkillManager:
             info = "Loaded skills:\n"
             for skill in self.loaded_skills.values():
                 info += f"- {skill.name}: {skill.description}\n"
-            return info
+            return info.strip()
 
 class JarvisAgent:
-    """Enhanced Jarvis with LangChain agent capabilities"""
-    
     def __init__(self):
         self.skill_manager = SkillManager()
-        self.llm = Ollama(
-            model="llama3.2:3b-instruct-q4_K_M",
-            base_url="http://localhost:11434"
+        
+        # Initialize LLM with better configuration
+        self.llm = OllamaLLM(
+            model="gemma:2b",
+            base_url="http://localhost:11434",
+            temperature=0.7,
+            timeout=30,
+            callbacks=[StreamingStdOutCallbackHandler()]
         )
-        self.memory = ConversationBufferWindowMemory(
-            k=10, 
-            return_messages=True,
+        
+        # Initialize memory with updated implementation
+        self.history = ChatMessageHistory()
+        self.memory = ConversationBufferMemory(
             memory_key="chat_history",
-            input_key="input"
+            chat_memory=self.history,
+            return_messages=True,
+            input_key="input",
+            output_key="output"
         )
+        
         self.agent_executor = None
+        self.last_skill_count = 0
         self._setup_agent()
-    
-    def _setup_agent(self):
-        """Setup the LangChain agent with current skills"""
-        try:
-            skills = self.skill_manager.load_skills()
-            
-            if not skills:
-                print("⚠️ No skills loaded, agent will work with basic capabilities only")
-                return
-            
-            # Create a more focused prompt template
-            template = """You are Jarvis, an AI assistant dedicated to serving Rohit Pulle. 
-You have access to tools that can help you provide accurate information.
-Always answer in the minimum number of steps. Do not repeat or rephrase the question.
 
-Available tools:
+    def _test_llm_connection(self) -> bool:
+        """Test if LLM is accessible"""
+        try:
+            print("🔍 Testing LLM connection...")
+            response = self.llm.invoke("Hello")
+            print(f"✅ LLM connection successful: {response[:50]}...")
+            return True
+        except Exception as e:
+            print(f"❌ LLM connection failed: {e}")
+            return False
+
+    def _setup_agent(self):
+        """Set up the agent with loaded skills"""
+        skills = self.skill_manager.load_skills()
+        self.last_skill_count = len(skills)
+        
+        if not skills:
+            print("⚠️ No skills loaded, agent will not be initialized")
+            self.agent_executor = None
+            return
+        
+        print(f"🔧 Setting up agent with {len(skills)} skills")
+        
+        # Bind tools to the LLM
+        try:
+            llm_with_tools = self.llm.bind_tools(tools=skills)
+        except Exception as e:
+            print(f"❌ Failed to bind tools to LLM: {e}")
+            traceback.print_exc()
+            self.agent_executor = None
+            return
+        
+        # Define the prompt template with explicit tool usage instruction
+        prompt = PromptTemplate.from_template("""
+You are Jarvis, an AI assistant dedicated to serving Rohit Pulle. Answer the following question as best you can. You have access to the following tools:
+
 {tools}
 
-Use the following format EXACTLY:
+If the question involves time or location, use the get_current_time tool with the specified location.
+
+Use the following format:
 
 Question: the input question you must answer
-Thought: I need to think about what information is needed
-Action: [tool name]
-Action Input: [input for the tool]
-Observation: [result from the tool]
+Thought: you should always think about what to do
+Action: the action to take, should be one of [{tool_names}]
+Action Input: the input to the action
+Observation: the result of the action
+... (this Thought/Action/Action Input/Observation can repeat N times)
 Thought: I now know the final answer
-Final Answer: [the final answer to the question]
+Final Answer: the final answer to the original input question
 
-IMPORTANT RULES:
-1. You MUST use the exact format above
-2. Action Input must be on its own line
-3. Only use tool names from the available tools: {tool_names}
-4. After getting an Observation, provide a Final Answer
-5. Do not repeat the same action multiple times
-6. When using a tool, follow the instructions in the description and do not deviate, do not provide lengthy explanations or extra text.
-7. Do NOT write code, pseudo-code, or describe steps. Just carry out the actions using the tools provided. Only use the Action and Action Input format as shown.
-8. Never explain your reasoning or output, just use the tools are shown.
-9. After you have used a tool and received an Observation that answers the user's question, you MUST immediately output:
-Thought: I now know the final answer
-Final Answer: [the answer]
-and then STOP.
-10. Do NOT ask or answer any new questions unless the user asks them.
-11. Do NOT repeat the same Action or Action Input more than once per user question.
-12. You must answer in as few steps as possible. If a tool gives you the answer, immediately output the Final Answer and stop.
-13. If none of the available tools are relevant to the question, answer directly using your own knowledge. Do NOT use any tool in that case.
+Begin!
+
 Question: {input}
-Thought: {agent_scratchpad}"""
-
-            prompt = PromptTemplate(
-                template=template,
-                input_variables=["input", "agent_scratchpad", "tools", "tool_names"]
-            )
-            
-            # Create agent executor with better error handling
-            self.agent_executor = initialize_agent(
+Thought: {agent_scratchpad}
+""")
+        
+        try:
+            agent = create_react_agent(self.llm, skills, prompt)
+            self.agent_executor = AgentExecutor(
+                agent=agent,
                 tools=skills,
-                llm=self.llm,
-                agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
-                verbose=True,
-                max_iterations=1,
-                max_execution_time=30,
-                early_stopping_method="generate",
-                handle_parsing_errors=True,
                 memory=self.memory,
-                agent_kwargs={
-                    "prefix": "You are Jarvis, an AI assistant dedicated to serving Rohit Pulle. Use the available tools to help answer questions accurately."
-                }
+                verbose=True,
+                handle_parsing_errors=True
             )
-            
-            print(f"🤖 Agent initialized with {len(skills)} skills")
-            
+            print("✅ Agent initialized successfully")
         except Exception as e:
-            print(f"❌ Error setting up agent: {e}")
+            print(f"❌ Failed to initialize agent: {e}")
             traceback.print_exc()
-    
+            self.agent_executor = None
+
+    def _should_reload_skills(self) -> bool:
+        """Check if skills need to be reloaded"""
+        current_skills = self.skill_manager.load_skills()
+        return len(current_skills) != self.last_skill_count
+
     def reload_skills(self):
         """Reload skills and reinitialize agent"""
-        print("🔄 Reloading skills...")
+        print("🔄 Reloading skills and reinitializing agent...")
         self._setup_agent()
+    
+    def get_skill_info(self) -> str:
+        """Get information about loaded skills"""
+        return self.skill_manager.get_skill_info()
     
     def process_query(self, query: str) -> str:
         """Process a query using the agent or fallback to basic LLM"""
+        if not query or not query.strip():
+            return "I didn't receive a valid query. Please try again."
+        
+        query = query.strip()
+        
         try:
-            # Check if we need to reload skills
-            current_skills = self.skill_manager.load_skills()
-            if len(current_skills) != len(self.skill_manager.loaded_skills):
+            if self._should_reload_skills():
+                print("🔄 Skills changed, reloading agent...")
                 self.reload_skills()
             
-            # If we have an agent, use it
             if self.agent_executor:
-                try:
-                    # Clean the query to avoid parsing issues
-                    cleaned_query = query.strip()
-                    
-                    print(f"🤖 Processing query: {cleaned_query}")
-                    response = self.agent_executor.invoke({"input": cleaned_query})
-                    
-                    # Extract the output properly
-                    if isinstance(response, dict):
-                        if "output" in response:
-                            return response["output"]
-                        elif "result" in response:
-                            return response["result"]
-                        else:
-                            return str(response)
-                    else:
-                        return str(response)
-                        
-                except Exception as e:
-                    print(f"⚠️ Agent execution failed: {e}")
-                    traceback.print_exc()
-                    # Fallback to basic LLM
-                    return self._basic_llm_response(query)
+                print(f"🤖 Processing query with agent: {query}")
+                response = self.agent_executor.invoke({"input": query})
+                if isinstance(response, dict):
+                    result = response.get("output", response.get("result", str(response)))
+                else:
+                    result = str(response)
+                
+                return result.strip() if result and result.strip() else "I processed your request but didn't generate a response."
             else:
+                print("🔄 No agent available, using basic LLM...")
                 return self._basic_llm_response(query)
                 
         except Exception as e:
             print(f"❌ Error processing query: {e}")
+            traceback.print_exc()
             return "I apologize, I encountered an error processing your request."
     
     def _basic_llm_response(self, query: str) -> str:
-        """Fallback to basic LLM without skills"""
+        """Fallback to basic LLM with tool usage for time queries"""
         try:
-            response = self.llm.invoke(f"You are Jarvis, an AI dedicated to serving Rohit Pulle. Provide a clear, complete and concise answer to: {query}")
-            return response
+            # Check if the query is about time and location
+            time_pattern = re.compile(r"(?:what(?:'s| is)\s*(?:the)?\s*(?:current)?\s*time\s*(?:in)?\s*([a-zA-Z\s]+))", re.IGNORECASE)
+            match = time_pattern.search(query)
+            if match:
+                location = match.group(1).strip()
+                # Find the get_current_time tool
+                for skill in self.skill_manager.loaded_skills.values():
+                    if skill.name == "get_current_time":
+                        return skill.invoke({"location": location})
+            
+            # Fallback to basic LLM if no time query
+            prompt = f"""You are Jarvis, an AI assistant dedicated to serving Rohit Pulle. 
+Provide a helpful, clear, and concise answer to the following question:
+
+Question: {query}
+
+Answer:"""
+            
+            response = self.llm.invoke(prompt)
+            return response.strip() if response and response.strip() else "I'm sorry, I couldn't generate a response to your question."
+                
         except Exception as e:
             print(f"❌ Basic LLM failed: {e}")
+            traceback.print_exc()
             return "I apologize, I'm having trouble processing your request right now."
+
+    def get_status(self) -> str:
+        """Get current agent status"""
+        skills = self.skill_manager.load_skills()
+        status = f"Agent Status:\n"
+        status += f"- Skills loaded: {len(skills)}\n"
+        status += f"- Agent active: {'Yes' if self.agent_executor else 'No'}\n"
+        status += f"- LLM model: gemma:2b\n"
+        
+        if skills:
+            status += "\nAvailable skills:\n"
+            for skill in skills:
+                status += f"  - {skill.name}: {skill.description}\n"
+        
+        return status
 
 # Initialize the enhanced Jarvis agent
 jarvis_agent = None
@@ -323,8 +391,10 @@ print("🤖 Initializing Jarvis agent with skills...")
 try:
     jarvis_agent = JarvisAgent()
     print("✅ Jarvis agent initialized")
+    print(jarvis_agent.get_status())
 except Exception as e:
     print(f"❌ Failed to initialize Jarvis agent: {e}")
+    traceback.print_exc()
     print("🔄 Continuing with basic functionality...")
 
 def record_audio_vad(max_duration=30, samplerate=SAMPLERATE):
@@ -443,135 +513,94 @@ def transcription_worker():
             audio_np = audio_queue.get(timeout=0.1)
         except queue.Empty:
             continue
-        start = time.time()
-        buf = BytesIO()
-        sf.write(buf, audio_np, SAMPLERATE, format='WAV')
-        buf.seek(0)
-        segments, _ = whisper_model.transcribe(buf)
-        text = " ".join(seg.text for seg in segments)
-        print(f"⏱️ Transcription took {time.time() - start:.2f}s")
-        print("You said:", text)
-        transcription_queue.put(text)
+        
+        try:
+            start = time.time()
+            buf = BytesIO()
+            sf.write(buf, audio_np, SAMPLERATE, format='WAV')
+            buf.seek(0)
+            segments, _ = whisper_model.transcribe(buf)
+            text = " ".join(seg.text for seg in segments).strip()
+            print(f"⏱️ Transcription took {time.time() - start:.2f}s")
+            
+            if text:
+                print("You said:", text)
+                transcription_queue.put(text)
+            else:
+                print("⚠️ No transcription result")
+                
+        except Exception as e:
+            print(f"❌ Transcription error: {e}")
+            traceback.print_exc()
+            
         audio_queue.task_done()
 
-def llm_worker():
-    """Modified LLM worker to handle agent responses better"""
-    chunk_end_chars = {'.', '!', '?', ',', ';', ':', '—', '–', '-'}
-    
-    def find_punctuation_chunk(text, chunk_sequence=0):
-        text = text.strip()
-        
-        if not text:
-            return None
-        
-        min_length = 10 if chunk_sequence == 0 else 15
-        
-        if len(text) < min_length and chunk_sequence > 0:
-            return None
-        
-        for i, char in enumerate(text):
-            if char in chunk_end_chars and i >= min_length:
-                end_pos = i + 1
-                while end_pos < len(text) and text[end_pos] in ' \t':
-                    end_pos += 1
-                return text[:end_pos].strip()
-        
-        if len(text) > 100:
-            for i in range(80, len(text)):
-                if text[i] == ' ':
-                    return text[:i].strip()
-        
-        return None
+def split_into_chunks(text, min_len=20):
+    """Split response into sentence-like chunks."""
+    text = text.strip()
+    if not text:
+        return []
 
+    sentence_enders = re.compile(r'([.!?])')
+    parts = sentence_enders.split(text)
+    chunks = []
+
+    current = ""
+    for part in parts:
+        if part in ".!?":
+            current += part
+            if len(current.strip()) >= min_len:
+                chunks.append(current.strip())
+                current = ""
+        else:
+            current += part
+
+    if current.strip():
+        chunks.append(current.strip())
+
+    return chunks if chunks else [text]
+
+def llm_worker():
     while not stop_event.is_set():
         try:
             prompt = transcription_queue.get(timeout=0.1)
         except queue.Empty:
             continue
 
-        if prompt.lower() in ["exit", "quit", "shutdown"]:
-            print("Shutdown command detected, stopping.")
-            stop_event.set()
-            transcription_queue.task_done()
-            break
-
         print("⏱️ LLM call started")
         start = time.time()
-        chunk_sequence = 0
-        
+
         global playback_active
         response_complete_event.clear()
         with audio_stream_lock:
             global audio_buffer
             audio_buffer = np.array([], dtype=np.float32)
             playback_active = True
-        
-        try:
-            # Use the enhanced Jarvis agent if available
-            if jarvis_agent:
-                # Use streaming invoke
-                response_chunks = jarvis_agent.agent_executor.stream({"input": prompt})
-                full_output = ""
-                final_answer_found = False
-                for chunk in response_chunks:
-                    text = chunk.get("output") or chunk.get("result") or str(chunk)
-                    if not text:
-                        continue
-                    full_output += text + " "
-                    # Check for Final Answer
-                    if "Final Answer:" in full_output:
-                        # Extract only the last Final Answer (handles repeated or noisy output)
-                        parts = full_output.rsplit("Final Answer:", 1)
-                        answer = parts[-1].strip()
-                        # Optionally, remove anything after a new "Question:" or agent log
-                        answer = answer.split("Question:")[0].strip()
-                        # Remove any trailing curly braces or agent logs
-                        answer = answer.split("}")[-1].strip() if "}" in answer else answer
-                        if answer:
-                            print(f"📝 Streaming final answer: {answer!r}")
-                            tts_synthesis_queue.put((0, 0, answer, True))
-                            final_answer_found = True
-                            break  # Stop processing further chunks
-                if not final_answer_found:
-                    # Normalize whitespace and newlines for robust matching
-                    normalized = full_output.replace('\n', ' ').replace('\r', ' ')
-                    # Try to extract the last Final Answer
-                    fa_match = re.findall(r"Final Answer:\s*(.*?)(?=(?:Question:|Thought:|Action:|Action Input:|Observation:|$))", normalized, re.DOTALL)
-                    if fa_match:
-                        answer = fa_match[-1].strip()
-                    else:
-                        # Try to extract the last Observation
-                        obs_match = re.findall(r"Observation:\s*(.*?)(?=(?:Question:|Thought:|Action:|Action Input:|Final Answer:|$))", normalized, re.DOTALL)
-                        if obs_match:
-                            answer = obs_match[-1].strip()
-                        else:
-                            # Try to extract the last human sentence
-                            cleaned = re.sub(r"\{.*?\}", "", normalized)
-                            cleaned = re.sub(r"(Question:|Thought:|Action:|Action Input:).*", "", cleaned)
-                            cleaned = re.sub(r",?\s*response_metadata=.*", "", cleaned)
-                            sentences = re.findall(r"([A-Z][^\.!?]*[\.!?])", cleaned)
-                            if sentences:
-                                answer = sentences[-1].strip()
-                            else:
-                                answer = cleaned.strip()
-                    # If answer is still empty or looks like junk, use a default message
-                    if not answer or "response_metadata" in answer or answer.startswith(","):
-                        answer = "Sorry, I could not extract a valid answer."
-                    print(f"📝 Fallback streaming answer: {answer!r}")
-                    tts_synthesis_queue.put((0, 0, answer, True))
-            else:
-                # Fallback to original streaming approach
-                # [Original streaming code remains the same]
-                pass
 
-            print(f"⏱️ LLM call finished in {time.time() - start:.2f}s")
+        try:
+            if jarvis_agent:
+                response = jarvis_agent.process_query(prompt)
+            else:
+                response = "Sorry, I have no brain right now."
+
+            if not response or not response.strip():
+                response = "I'm sorry, I couldn't generate a response."
+
+            chunks = split_into_chunks(response)
+            print(f"💬 Split into {len(chunks)} chunks")
+
+            for i, chunk in enumerate(chunks):
+                is_final = i == len(chunks) - 1
+                print(f"📤 Sending chunk {i}: {chunk!r} (final={is_final})")
+                tts_synthesis_queue.put((0, i, chunk, is_final))
 
         except Exception as e:
-            print("LLM request error:", e)
+            print("💥 LLM request error:", e)
             traceback.print_exc()
-            tts_synthesis_queue.put((0, 0, "Sorry, I encountered an error.", True))
+            tts_synthesis_queue.put((0, 0, "Sorry, I encountered an error processing your request.", True))
 
         transcription_queue.task_done()
+        print(f"⏱️ LLM call finished in {time.time() - start:.2f}s")
 
 def tts_synthesis_worker(worker_id):
     tts_instance = tts_instances[worker_id]
@@ -750,7 +779,7 @@ def main():
 
     print("✅ Ready. Say 'Jarvis' to activate.")
     if jarvis_agent:
-        print(f"🤖 {jarvis_agent.skill_manager.get_skill_info()}")
+        print(f"🤖 {jarvis_agent.get_skill_info()}")
 
     try:
         while not stop_event.is_set():
